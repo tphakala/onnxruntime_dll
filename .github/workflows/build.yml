@@ -1,0 +1,404 @@
+name: Build ONNX Runtime Multi-EP
+
+on:
+  workflow_dispatch:
+    inputs:
+      onnxruntime_version:
+        description: 'ONNX Runtime version/tag (e.g., v1.22.0)'
+        required: true
+        default: 'v1.22.0'
+        type: string
+      enable_cuda:
+        description: 'Enable CUDA Execution Provider'
+        required: true
+        default: true
+        type: boolean
+      enable_tensorrt:
+        description: 'Enable TensorRT Execution Provider'
+        required: true
+        default: true
+        type: boolean
+      enable_openvino:
+        description: 'Enable OpenVINO Execution Provider'
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+env:
+  # Version configuration - update these when bumping versions
+  CUDA_VERSION: '12.6.3'
+  CUDA_VERSION_SHORT: '12.6'
+  CUDNN_VERSION: '9.6.0'
+  TENSORRT_VERSION: '10.7.0.23'
+  OPENVINO_VERSION: '2025.1.0'
+  PYTHON_VERSION: '3.11'
+  CMAKE_VERSION: '3.28.0'
+
+  # Paths
+  CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6'
+  CUDNN_PATH: 'C:\tools\cudnn'
+  TENSORRT_PATH: 'C:\tools\tensorrt'
+  OPENVINO_PATH: 'C:\tools\openvino'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Set up build inputs
+        id: inputs
+        shell: pwsh
+        run: |
+          # Handle both workflow_dispatch and tag push triggers
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.onnxruntime_version }}"
+            $enableCuda = "${{ inputs.enable_cuda }}"
+            $enableTensorrt = "${{ inputs.enable_tensorrt }}"
+            $enableOpenvino = "${{ inputs.enable_openvino }}"
+          } else {
+            # For tag pushes, enable all EPs and use tag as version
+            $version = "${{ github.ref_name }}"
+            $enableCuda = "true"
+            $enableTensorrt = "true"
+            $enableOpenvino = "true"
+          }
+
+          # Normalize version (remove 'v' prefix for artifact naming)
+          $versionClean = $version -replace '^v', ''
+
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "version_clean=$versionClean" >> $env:GITHUB_OUTPUT
+          echo "enable_cuda=$enableCuda" >> $env:GITHUB_OUTPUT
+          echo "enable_tensorrt=$enableTensorrt" >> $env:GITHUB_OUTPUT
+          echo "enable_openvino=$enableOpenvino" >> $env:GITHUB_OUTPUT
+
+          # Build EP suffix for artifact naming
+          $epSuffix = ""
+          if ($enableCuda -eq "true") { $epSuffix += "-cuda" }
+          if ($enableTensorrt -eq "true") { $epSuffix += "-tensorrt" }
+          if ($enableOpenvino -eq "true") { $epSuffix += "-openvino" }
+          echo "ep_suffix=$epSuffix" >> $env:GITHUB_OUTPUT
+
+      - name: Checkout ONNX Runtime
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/onnxruntime
+          ref: ${{ steps.inputs.outputs.version }}
+          path: onnxruntime
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy packaging wheel
+
+      - name: Set up Visual Studio
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Cache CUDA Toolkit
+        if: steps.inputs.outputs.enable_cuda == 'true'
+        id: cache-cuda
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ env.CUDA_VERSION_SHORT }}
+          key: cuda-${{ env.CUDA_VERSION }}-windows
+
+      - name: Install CUDA Toolkit
+        if: steps.inputs.outputs.enable_cuda == 'true' && steps.cache-cuda.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          .\scripts\install-cuda.ps1 -CudaVersion "${{ env.CUDA_VERSION }}"
+
+      - name: Cache cuDNN
+        if: steps.inputs.outputs.enable_cuda == 'true'
+        id: cache-cudnn
+        uses: actions/cache@v4
+        with:
+          path: C:\tools\cudnn
+          key: cudnn-${{ env.CUDNN_VERSION }}-cuda${{ env.CUDA_VERSION_SHORT }}-windows
+
+      - name: Install cuDNN
+        if: steps.inputs.outputs.enable_cuda == 'true' && steps.cache-cudnn.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          CUDNN_DOWNLOAD_URL: ${{ secrets.CUDNN_DOWNLOAD_URL }}
+        run: |
+          .\scripts\install-cudnn.ps1 -CudnnVersion "${{ env.CUDNN_VERSION }}" -CudaVersionShort "${{ env.CUDA_VERSION_SHORT }}"
+
+      - name: Cache TensorRT
+        if: steps.inputs.outputs.enable_tensorrt == 'true'
+        id: cache-tensorrt
+        uses: actions/cache@v4
+        with:
+          path: C:\tools\tensorrt
+          key: tensorrt-${{ env.TENSORRT_VERSION }}-cuda${{ env.CUDA_VERSION_SHORT }}-windows
+
+      - name: Install TensorRT
+        if: steps.inputs.outputs.enable_tensorrt == 'true' && steps.cache-tensorrt.outputs.cache-hit != 'true'
+        shell: pwsh
+        env:
+          TENSORRT_DOWNLOAD_URL: ${{ secrets.TENSORRT_DOWNLOAD_URL }}
+        run: |
+          .\scripts\install-tensorrt.ps1 -TensorrtVersion "${{ env.TENSORRT_VERSION }}" -CudaVersionShort "${{ env.CUDA_VERSION_SHORT }}"
+
+      - name: Cache OpenVINO
+        if: steps.inputs.outputs.enable_openvino == 'true'
+        id: cache-openvino
+        uses: actions/cache@v4
+        with:
+          path: C:\tools\openvino
+          key: openvino-${{ env.OPENVINO_VERSION }}-windows
+
+      - name: Install OpenVINO
+        if: steps.inputs.outputs.enable_openvino == 'true' && steps.cache-openvino.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          .\scripts\install-openvino.ps1 -OpenvinoVersion "${{ env.OPENVINO_VERSION }}"
+
+      - name: Set up environment paths
+        shell: pwsh
+        run: |
+          # Add CUDA to PATH
+          if ("${{ steps.inputs.outputs.enable_cuda }}" -eq "true") {
+            $cudaPath = "${{ env.CUDA_PATH }}"
+            echo "$cudaPath\bin" >> $env:GITHUB_PATH
+            echo "$cudaPath\libnvvp" >> $env:GITHUB_PATH
+            echo "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+            echo "CUDA_HOME=$cudaPath" >> $env:GITHUB_ENV
+
+            # cuDNN
+            $cudnnPath = "${{ env.CUDNN_PATH }}"
+            echo "$cudnnPath\bin" >> $env:GITHUB_PATH
+            echo "CUDNN_PATH=$cudnnPath" >> $env:GITHUB_ENV
+          }
+
+          # Add TensorRT to PATH
+          if ("${{ steps.inputs.outputs.enable_tensorrt }}" -eq "true") {
+            $trtPath = "${{ env.TENSORRT_PATH }}"
+            echo "$trtPath\bin" >> $env:GITHUB_PATH
+            echo "$trtPath\lib" >> $env:GITHUB_PATH
+            echo "TENSORRT_ROOT=$trtPath" >> $env:GITHUB_ENV
+          }
+
+          # Set up OpenVINO environment
+          if ("${{ steps.inputs.outputs.enable_openvino }}" -eq "true") {
+            $ovinoPath = "${{ env.OPENVINO_PATH }}"
+            echo "$ovinoPath\runtime\bin\intel64\Release" >> $env:GITHUB_PATH
+            echo "$ovinoPath\runtime\3rdparty\tbb\bin" >> $env:GITHUB_PATH
+            echo "INTEL_OPENVINO_DIR=$ovinoPath" >> $env:GITHUB_ENV
+            echo "OpenVINO_DIR=$ovinoPath\runtime\cmake" >> $env:GITHUB_ENV
+          }
+
+      - name: Build ONNX Runtime
+        shell: pwsh
+        working-directory: onnxruntime
+        run: |
+          # Build arguments
+          $buildArgs = @(
+            "--config", "Release",
+            "--build_shared_lib",
+            "--parallel",
+            "--skip_tests",
+            "--cmake_generator", "Visual Studio 17 2022"
+          )
+
+          # Add CUDA EP
+          if ("${{ steps.inputs.outputs.enable_cuda }}" -eq "true") {
+            $buildArgs += "--use_cuda"
+            $buildArgs += "--cuda_home", "${{ env.CUDA_PATH }}"
+            $buildArgs += "--cudnn_home", "${{ env.CUDNN_PATH }}"
+          }
+
+          # Add TensorRT EP
+          if ("${{ steps.inputs.outputs.enable_tensorrt }}" -eq "true") {
+            $buildArgs += "--use_tensorrt"
+            $buildArgs += "--tensorrt_home", "${{ env.TENSORRT_PATH }}"
+          }
+
+          # Add OpenVINO EP
+          if ("${{ steps.inputs.outputs.enable_openvino }}" -eq "true") {
+            $buildArgs += "--use_openvino", "CPU"
+          }
+
+          Write-Host "Build arguments: $($buildArgs -join ' ')"
+
+          # Run the build
+          python tools\ci_build\build.py $buildArgs
+
+      - name: Collect build artifacts
+        shell: pwsh
+        run: |
+          $artifactDir = "artifacts"
+          New-Item -ItemType Directory -Force -Path $artifactDir
+
+          # Main ONNX Runtime DLL
+          $buildDir = "onnxruntime\build\Windows\Release\Release"
+
+          # Copy main DLLs
+          $dllsToCopy = @(
+            "onnxruntime.dll",
+            "onnxruntime.lib",
+            "onnxruntime.pdb",
+            "onnxruntime_providers_shared.dll",
+            "onnxruntime_providers_shared.lib",
+            "onnxruntime_providers_shared.pdb"
+          )
+
+          # Add EP-specific DLLs
+          if ("${{ steps.inputs.outputs.enable_cuda }}" -eq "true") {
+            $dllsToCopy += @(
+              "onnxruntime_providers_cuda.dll",
+              "onnxruntime_providers_cuda.lib",
+              "onnxruntime_providers_cuda.pdb"
+            )
+          }
+
+          if ("${{ steps.inputs.outputs.enable_tensorrt }}" -eq "true") {
+            $dllsToCopy += @(
+              "onnxruntime_providers_tensorrt.dll",
+              "onnxruntime_providers_tensorrt.lib",
+              "onnxruntime_providers_tensorrt.pdb"
+            )
+          }
+
+          if ("${{ steps.inputs.outputs.enable_openvino }}" -eq "true") {
+            $dllsToCopy += @(
+              "onnxruntime_providers_openvino.dll",
+              "onnxruntime_providers_openvino.lib",
+              "onnxruntime_providers_openvino.pdb"
+            )
+          }
+
+          foreach ($dll in $dllsToCopy) {
+            $sourcePath = Join-Path $buildDir $dll
+            if (Test-Path $sourcePath) {
+              Copy-Item $sourcePath $artifactDir -Verbose
+            } else {
+              Write-Warning "File not found: $sourcePath"
+            }
+          }
+
+          # Copy headers
+          $includeDir = Join-Path $artifactDir "include"
+          New-Item -ItemType Directory -Force -Path $includeDir
+          Copy-Item "onnxruntime\include\onnxruntime\core\session\*.h" $includeDir -Verbose
+
+          # List collected artifacts
+          Write-Host "Collected artifacts:"
+          Get-ChildItem -Recurse $artifactDir | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $checksumFile = "artifacts\SHA256SUMS.txt"
+          Get-ChildItem -Path "artifacts" -File | Where-Object { $_.Name -ne "SHA256SUMS.txt" } | ForEach-Object {
+            $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Out-File -Append -FilePath $checksumFile
+          }
+          Write-Host "Checksums:"
+          Get-Content $checksumFile
+
+      - name: Test DLL loading
+        shell: pwsh
+        run: |
+          # Simple test to verify DLL can be loaded
+          $testScript = @'
+          import ctypes
+          import os
+
+          dll_path = r"artifacts\onnxruntime.dll"
+          if os.path.exists(dll_path):
+              try:
+                  dll = ctypes.CDLL(dll_path)
+                  print(f"Successfully loaded: {dll_path}")
+
+                  # Try to get API version
+                  try:
+                      get_version = dll.OrtGetApiBase
+                      get_version.restype = ctypes.c_void_p
+                      api_base = get_version()
+                      print(f"OrtGetApiBase returned: {api_base}")
+                  except Exception as e:
+                      print(f"Could not call OrtGetApiBase: {e}")
+
+              except Exception as e:
+                  print(f"Failed to load DLL: {e}")
+                  exit(1)
+          else:
+              print(f"DLL not found at: {dll_path}")
+              exit(1)
+          '@
+
+          $testScript | python
+
+      - name: Create artifact archive
+        shell: pwsh
+        run: |
+          $version = "${{ steps.inputs.outputs.version_clean }}"
+          $epSuffix = "${{ steps.inputs.outputs.ep_suffix }}"
+          $archiveName = "onnxruntime-$version-win-x64$epSuffix.zip"
+
+          Compress-Archive -Path "artifacts\*" -DestinationPath $archiveName
+          echo "ARCHIVE_NAME=$archiveName" >> $env:GITHUB_ENV
+
+          # Generate checksum for the archive
+          $hash = (Get-FileHash -Path $archiveName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archiveName" | Out-File -FilePath "$archiveName.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-${{ steps.inputs.outputs.version_clean }}-win-x64${{ steps.inputs.outputs.ep_suffix }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          body: |
+            ## ONNX Runtime ${{ steps.inputs.outputs.version_clean }} - Windows x64 Multi-EP Build
+
+            ### Included Execution Providers
+            - CPU (always included)
+            - CUDA ${{ env.CUDA_VERSION_SHORT }} (NVIDIA GPU)
+            - TensorRT ${{ env.TENSORRT_VERSION }} (NVIDIA GPU optimization)
+            - OpenVINO ${{ env.OPENVINO_VERSION }} (Intel CPU/GPU/NPU)
+
+            ### Dependencies Versions
+            | Component | Version |
+            |-----------|---------|
+            | CUDA | ${{ env.CUDA_VERSION }} |
+            | cuDNN | ${{ env.CUDNN_VERSION }} |
+            | TensorRT | ${{ env.TENSORRT_VERSION }} |
+            | OpenVINO | ${{ env.OPENVINO_VERSION }} |
+
+            ### Runtime Requirements
+            - Windows 10/11 x64
+            - NVIDIA Driver 550+ (for CUDA/TensorRT)
+            - Visual C++ Redistributable 2022
+
+            ### Usage
+            Extract the ZIP and place DLLs alongside your application executable.
+
+            See README for detailed usage instructions.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
